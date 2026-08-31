@@ -599,6 +599,17 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
 
+        # Vision checkpoints (DeepSeek-V4-Flash-Vision-Exp) carry a second,
+        # modality-specific expert-selection bias per gate, applied only to
+        # image positions. Text routing is unchanged.
+        self.vl_vocab_size = config.vocab_size
+        self.gate.bias_vl = None
+        if int(getattr(config, "vision_n_layers", 0) or 0) > 0:
+            self.gate.bias_vl = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+
         if config.n_shared_experts is None:
             self.shared_experts = None
         else:
@@ -714,6 +725,16 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+
+        # Image positions carry out-of-vocabulary sentinel ids (vocab_size+0..4).
+        # tid2eid is sized [vocab_size, k], so they must not reach the hash
+        # lookup. Branch-free because this runs inside the torch.compile region,
+        # where a data-dependent `if mask.any()` cannot be captured.
+        image_mask = None
+        if input_ids is not None and getattr(self.gate, "bias_vl", None) is not None:
+            image_mask = input_ids >= self.vl_vocab_size
+            input_ids = torch.where(
+                image_mask, torch.zeros_like(input_ids), input_ids)
 
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)

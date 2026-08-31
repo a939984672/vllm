@@ -345,6 +345,10 @@ _SEQUENCE_CLASSIFICATION_MODELS = {
 }
 
 _MULTIMODAL_MODELS = {
+    "DeepseekV4VForConditionalGeneration": (
+        "vllm.models.deepseek_v4.vision_model",
+        "DeepseekV4VForConditionalGeneration",
+    ),
     # [Decoder-only]
     "AriaForConditionalGeneration": ("aria", "AriaForConditionalGeneration"),
     "AudioFlamingo3ForConditionalGeneration": (

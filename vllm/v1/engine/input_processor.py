@@ -505,7 +505,16 @@ class InputProcessor:
                 raise VLLMValidationError(
                     f"Token id {min_input_id} is out of vocabulary"
                 )
-            if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
+            allowed_max = max(tokenizer.max_token_id, model_vocab_size - 1)
+            # DeepSeek-V4 vision expands each image into a block of sentinel ids
+            # vocab_size + {0..4}. They never index the embedding table (the
+            # embeddings arrive through the multimodal path) but the language
+            # model reads them, to pick the bias_vl expert bias and to identify
+            # image spans.
+            hf_cfg = getattr(model_config, "hf_config", None)
+            if int(getattr(hf_cfg, "vision_n_layers", 0) or 0) > 0:
+                allowed_max = max(allowed_max, model_vocab_size + 4)
+            if max_input_id > allowed_max:
                 raise VLLMValidationError(
                     f"Token id {max_input_id} is out of vocabulary"
                 )
