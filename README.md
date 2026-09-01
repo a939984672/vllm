@@ -1,110 +1,71 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# dsv4-vision-exp — DeepSeek-V4-Flash-Vision-Exp on vLLM
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+> 这是 **`vLLM` 的 `dsv4-vision-exp` 分支**，为在 **vLLM v0.28.0** 上运行 DeepSeek 首个 V4 多模态实验模型 **DeepSeek-V4-Flash-Vision-Exp** 而做。
+>
+> ⚠️ **本分支并非 vLLM 官方主线**。它是开源社区在 v0.28.0 基线上的多模态支持移植，用独立分支形式发布，已在与作者相同的硬件上完整验证。
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+## 这个分支解决什么问题？
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+DeepSeek-V4-Flash-Vision-Exp（MIT，2026-08-31 开源，约 168 GB 权重）发布时，vLLM/SGLang 主线尚未支持——直接用 vLLM 加载会报：
+
+```
+ValueError: There is no module or parameter named 'aligner' in DeepseekV4ForCausalLM
+```
+
+本分支补齐了多模态加载与推理所需的全部适配，让模型能以 OpenAI 兼容 API 正常运行。
+
+## 已有功能
+
+- 图片理解（ViT + Aligner 视觉前端接入）
+- 图像 token 的哨兵机制（`vocab_size+{0..4}` 块展开）
+- `bias_vl` 模态分叉专家路由（对齐官方参考实现）
+- 图文 / 多图 / 计数 / 属性问答
+- SM120 的 sparse-MLA 路径（`vllm/vllm-openai:v0.28.0` 镜像）
+
+## 硬件与软件要求
+
+- **GPU**：2× NVIDIA RTX PRO 6000 Blackwell 96GB（**SM120**），TP=2（作者验证配置）
+- 系统内存 ≥128 GB、磁盘约 170 GB（权重）、NVIDIA 驱动 ≥575、Docker
+- 基础镜像：`vllm/vllm-openai:v0.28.0`（免本地编译，纯 Python 挂载）
+
+## 快速开始
+
+```bash
+# 1. 克隆本分支（已含全部改动）
+git clone --depth 1 --branch dsv4-vision-exp https://github.com/a939984672/vllm.git
+cd vllm
+# 2. 下载模型权重（约 168 GB）
+hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --local-dir /data/models/DeepSeek-V4-Flash-Vision-Exp
+# 3. 运行容器（路径按实际替换）
+docker run -d --gpus all --name dsv4-vision-exp -p 6007:8000 \
+  -v /data/models/DeepSeek-V4-Flash-Vision-Exp:/model \
+  -v $(pwd)/vllm/models/deepseek_v4:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4 \
+  -v $(pwd)/vllm/v1/engine/input_processor.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/input_processor.py \
+  -v $(pwd)/vllm/model_executor/models/registry.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/registry.py \
+  -v $(pwd)/vllm/v1/attention/backends/mla/sparse_swa.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
+  --shm-size=100g vllm/vllm-openai:v0.28.0 /model \
+  --served-model-name dsv4v \
+  --hf-overrides '{"architectures":["DeepseekV4VForConditionalGeneration"],"is_mm_prefix_lm":true}' \
+  --host 0.0.0.0 --port 8000 --trust-remote-code --tensor-parallel-size 2 \
+  --kv-cache-dtype fp8 --gpu-memory-utilization 0.96 --max-model-len 1000000 --max-num-seqs 4 \
+  --enable-prefix-caching --enable-chunked-prefill \
+  --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice \
+  --reasoning-parser deepseek_v4 \
+  --structured-outputs-config '{"backend":"xgrammar"}' \
+  --default-chat-template-kwargs.thinking=true --default-chat-template-kwargs.reasoning_effort=max
+```
+
+## 更多说明
+
+- **完整文档（建议收藏）**：见上游代码库中本分支的 `DSV4_VISION_README.md`，或直接访问 [完整 README](https://github.com/a939984672/vllm/blob/dsv4-vision-exp/DSV4_VISION_README.md)
+- **Patch 发布包**：`dsv4-vision-exp-release-20260901.tar.gz`（含 5 个 patch、LICENSE、测试脚本）
+- **验证**：`curl http://localhost:6007/health`；图文请求 `python3 scripts/test_vision.py --port 6007 --image <图片>`
+
+## 致谢与许可
+
+- vLLM 代码改动遵循 **Apache License 2.0**；模型与官方参考代码为 **MIT License**
+- 感谢 [tacos8me](https://github.com/tacos8me)（vLLM issue #54561 初始多模态实现）与 DeepSeek 团队
 
 ---
 
-## About
-
-vLLM is a fast and easy-to-use library for LLM inference and serving.
-
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
-
-vLLM is fast with:
-
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
-
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
-
-```bash
-uv pip install vllm
-```
-
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
-
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+*本分支由社区维护，非 vLLM 官方发布。已知限制与 roadmap 见完整 README 的 "Known limitations" 小节。*
