@@ -1267,6 +1267,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            # Vision-Exp hash-gated layers (0..num_hash_layers-1) carry a
+            # routing bias in the checkpoint that the tid2eid-driven router
+            # never consumes, and this build does not instantiate that
+            # parameter. Skip it explicitly (upstream main digests it in the
+            # loader fallback path).
+            if (
+                name.endswith(".ffn.gate.e_score_correction_bias")
+                and name not in params_dict
+            ):
+                continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
