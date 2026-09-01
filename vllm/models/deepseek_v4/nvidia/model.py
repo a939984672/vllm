@@ -719,6 +719,11 @@ class DeepseekV4MoE(nn.Module):
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
         )
+        if self.gate.bias_vl is not None:
+            _router = getattr(self.experts, "router", None)
+            if _router is not None:
+                _router.bias_vl = self.gate.bias_vl
+                _router.vl_vocab_size = self.vl_vocab_size
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None

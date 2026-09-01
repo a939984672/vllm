@@ -335,6 +335,48 @@ class FusedTopKBiasRouter(BaseRouter):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
+    def _compute_routing_vision(
+        self,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        indices_type: torch.dtype | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """DeepSeek-V4 vision routing, mirroring the reference gate.forward.
+
+        Image tokens (sentinel ids >= vl_vocab_size) select experts with
+        bias_vl-shifted scores; text tokens keep the stock routing. Hash
+        layers resolve text tokens via tid2eid and route image tokens by
+        score. Routing weights always come from the unbiased scores.
+        """
+        scores = router_logits.to(torch.float32)
+        scores = torch.nn.functional.softplus(scores).sqrt()
+        original_scores = scores
+        image_mask = input_ids >= self.vl_vocab_size
+        if self._hash_indices_table is not None:
+            safe_ids = torch.where(
+                image_mask, torch.zeros_like(input_ids), input_ids
+            ).to(dtype=self._hash_indices_table.dtype)
+            indices = self._hash_indices_table[safe_ids]
+            vl_indices = (scores + self.bias_vl).topk(self.top_k, dim=-1)[1]
+            indices = torch.where(
+                image_mask.unsqueeze(-1),
+                vl_indices.to(indices.dtype),
+                indices,
+            )
+        else:
+            bias = torch.where(
+                image_mask.unsqueeze(-1),
+                self.bias_vl,
+                self.e_score_correction_bias,
+            )
+            indices = (scores + bias).topk(self.top_k, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights * self.routed_scaling_factor
+        if indices_type is not None:
+            indices = indices.to(indices_type)
+        return weights, indices
+
     def _compute_routing(
         self,
         hidden_states: torch.Tensor,
@@ -344,6 +386,9 @@ class FusedTopKBiasRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using fused top-k with bias."""
+        bias_vl = getattr(self, "bias_vl", None)
+        if bias_vl is not None and input_ids is not None:
+            return self._compute_routing_vision(router_logits, input_ids, indices_type)
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
             gating_output=router_logits,
