@@ -49,6 +49,9 @@ from vllm.models.deepseek_v4.vision import DeepseekV4Aligner, DeepseekV4ViT
     dummy_inputs=DeepseekV4VDummyInputsBuilder,
 )
 class DeepseekV4VForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+    # Image spans exceed the SWA window; the visible-window kernel clamps
+    # per-query, so keep the bidirectional doc ranges alive past the window.
+    mm_prefix_clamp_sliding_window = True
     # The LM's MoE gate selects `bias_vl` over `bias` per position and the hash
     # layers index tid2eid by token id, so the raw ids must reach forward().
     requires_raw_input_tokens = True
