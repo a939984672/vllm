@@ -1158,3 +1158,35 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
         )
 
     tl.store(sparse_topk_lens_ptr + token_idx, SWA_INDEX_WIDTH + topk_len)
+
+
+def compute_vision_visible_window(
+    input_ids: torch.Tensor,
+    vocab_size: int,
+    window_size: int,
+    max_image_tokens: int = 384,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token (left, right) visible extents for DeepSeek-V4 vision.
+
+    Mirrors the reference implementation's get_image_visible: inside each
+    [IMAGE_START, IMAGE_END] span, left is the distance to the span
+    start (clamped to max_image_tokens-1) and right the distance to the
+    span end (clamped to max_image_tokens). Tokens outside spans get (0, 0),
+    i.e. the stock causal window.
+    """
+    idx = torch.arange(input_ids.shape[-1], dtype=torch.int32, device=input_ids.device)
+    is_start = input_ids == (vocab_size + 0)
+    is_end = input_ids == (vocab_size + 4)
+    valid = (is_start.cumsum(-1) > is_end.cumsum(-1)) | is_end
+    starts = torch.where(is_start, idx, torch.zeros_like(idx)).cummax(-1)[0]
+    left = (idx - starts) * valid
+    ends = (
+        torch.where(is_end, idx, torch.full_like(idx, input_ids.shape[-1]))
+        .flip(-1)
+        .cummin(-1)[0]
+        .flip(-1)
+    )
+    right = (ends - idx) * valid
+    left = left.clamp(max=max_image_tokens - 1)
+    right = right.clamp(max=max_image_tokens)
+    return left.to(torch.int32), right.to(torch.int32)
