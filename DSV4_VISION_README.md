@@ -107,6 +107,8 @@ docker run -d \
   -v /opt/vllm/vllm/v1/engine/input_processor.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/input_processor.py \
   -v /opt/vllm/vllm/model_executor/models/registry.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/registry.py \
   -v /opt/vllm/vllm/v1/attention/backends/mla/sparse_swa.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
+  -v /opt/vllm/vllm/v1/worker/gpu_model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py \
+  -v /opt/vllm/fi-src/flashinfer:/usr/local/lib/python3.12/dist-packages/flashinfer \
   --shm-size=100g \
   vllm/vllm-openai:v0.28.0 \
   /model \
@@ -164,9 +166,35 @@ print(json.load(urllib.request.urlopen(req, timeout=300))["choices"][0]["message
 PY
 ```
 
+## 6.5 flashinfer kernel patch（visible-window 必需）
+
+上游 flashinfer v0.6.16 的 SM120 dual-path prefill kernel 将 SWA 段硬编码为 128（`dispatch_dsv4_dual: topk != 128 -> return false`），会拒绝 visible-window需要的 (512+512) 布局——**官方 `vllm/vllm-openai:deepseekv4-flash-vision` 镜像在 SM120 上也因同一约束无法启动**。
+
+本分支附带补丁 `docs/flashinfer_patches/flashinfer-sm120-tk512-dual.patch`：给 `dispatch_dsv4_dual` 增加 `FP8/TK=512/num_heads=32` 的 dual 模板实例。应用步骤（在运行容器内执行）：
+
+```bash
+# 1. 在 host 下载官方 wheel 并解包（获得完整 data 树）
+pip download flashinfer-python==0.6.16.post3 --no-deps -d /tmp/fiwheel
+cd /tmp/fiwheel && unzip -o -q *.whl -d extracted
+
+# 2. 组装源码树（git 树的 csrc + wheel 的 data）
+git clone --depth 1 --branch v0.6.16.post3 https://github.com/flashinfer-ai/flashinfer.git fi-src
+cd fi-src && git apply /opt/vllm/docs/flashinfer_patches/flashinfer-sm120-tk512-dual.patch
+mkdir -p flashinfer/data && cp -r /tmp/fiwheel/extracted/flashinfer/data/* flashinfer/data/
+cp -r csrc/* flashinfer/data/csrc/
+
+# 3. 将 flashinfer 目录挂载进容器（见上方 run命令的 fi-src/flashinfer 挂载行）
+#    并添加环境变量：-e FLASHINFER_DISABLE_VERSION_CHECK=1
+#    同时禁用 AOT 覆盖（容器内）：
+#    mv /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/sparse_mla_sm120{,.disabled}
+#    rm -rf /root/.cache/flashinfer/*/120f/cached_ops   # 清 JIT 缓存强制重编译
+```
+
+flashinfer 为 JIT 分发：patched 源码在首次调用时由 nvcc 现场编译（需容器内 nvcc，v0.28.0 镜像已含 CUDA 13.0）。
+
 ## 7. 已知限制与注意事项
 
-1. **注意力为因果（causal）**：图像 span 内的双向注意力（官方 visible-window）接线进行中；实测计数、属性、空间关系不受影响。
+1. **visible-window 双向注意力已启用**：图像 span 内为双向注意力（对齐官方参考实现），基于 patch 过的 flashinfer SM120 kernel（见下方 "flashinfer kernel patch"）。
 2. **thinking 预算**：`thinking=true` 时 reasoning 先消耗 `max_tokens`，图文问答建议 `max_tokens ≥ 1024`（长思考链可到 2048），否则 `content` 可能为空。
 3. **prefix caching**：默认开启且验证稳定；若在极端交错多图场景遇到 multimodal 区间错误，可加 `--no-enable-prefix-caching` 规避。
 4. **SM120 sparse kernel 组合约束**：SWA/extra 段宽度枚举 `{128, 512, 1024}`，部分组合（如 512+512）被 kernel 拒绝——勿自行加宽 SWA 段。
