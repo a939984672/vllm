@@ -18,10 +18,49 @@ blocks so it can record placeholder ranges.
 """
 
 import math
+import threading
 from collections.abc import Mapping, Sequence
 
 import numpy as np
 import torch
+
+# The HF tokenizer mutates its internal truncation state on every encode()
+# (set_truncation_and_padding borrows the Rust tokenizer), so concurrent
+# encode() calls on the shared tokenizer instance raise "Already borrowed".
+# vLLM runs multimodal preprocessing in a thread pool; serialize the encode.
+_TOKENIZER_LOCK = threading.Lock()
+
+# Broader fix: the borrow conflict is not limited to our encode() - the API
+# server tokenizes on the event loop while multimodal preprocessing runs in a
+# thread pool, and transformers' set_truncation_and_padding takes a mutable
+# borrow of the shared Rust tokenizer on EVERY encode. Serialize that state
+# mutation process-wide (microsecond-scale lock, encode itself stays parallel).
+try:
+    # The Rust tokenizer holds a mutable borrow for the WHOLE encode
+    # duration, so every entry point must serialize. _encode_plus is the
+    # single funnel all of them (encode / __call__ / encode_plus) fall
+    # through; tokenize is a fast CPU step, negligible next to GPU inference.
+    from transformers.tokenization_utils_tokenizers import TokenizersBackend as _TB
+
+    _ENCODE_LOCK = threading.Lock()
+
+    _orig_encode_plus = _TB._encode_plus
+
+    def _encode_plus_threadsafe(self, *args, **kwargs):
+        with _ENCODE_LOCK:
+            return _orig_encode_plus(self, *args, **kwargs)
+
+    _TB._encode_plus = _encode_plus_threadsafe
+
+    _orig_batch_encode_plus = _TB._batch_encode_plus
+
+    def _batch_encode_plus_threadsafe(self, *args, **kwargs):
+        with _ENCODE_LOCK:
+            return _orig_batch_encode_plus(self, *args, **kwargs)
+
+    _TB._batch_encode_plus = _batch_encode_plus_threadsafe
+except (ImportError, AttributeError):
+    pass
 from PIL import Image, ImageOps
 from transformers import BatchFeature
 
@@ -219,7 +258,8 @@ class DeepseekV4VMultiModalProcessor(BaseMultiModalProcessor[DeepseekV4VProcessi
         if not isinstance(images, (list, tuple)):
             images = [images]
 
-        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        with _TOKENIZER_LOCK:
+            prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
 
         # vLLM calls the processor with the text prompt and no images during
         # profiling and for text-only requests. The placeholder must then be
