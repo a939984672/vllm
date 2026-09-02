@@ -3748,6 +3748,20 @@ class GPUModelRunner(
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
 
+        # DeepseekV4 vision: flag whether this step carries image sentinel
+        # tokens. Computed here (outside the compiled region) so the MoE
+        # router can take the fused-kernel router for decode / pure-text.
+        try:
+            from vllm.models.deepseek_v4.mm_preprocess import set_step_has_images
+
+            _vhf = self.model_config.hf_config
+            if int(getattr(_vhf, "vision_n_layers", 0) or 0) > 0:
+                _vvoc = int(getattr(_vhf, "vocab_size", 0))
+                _vids = self.input_ids.gpu[:num_input_tokens]
+                set_step_has_images(bool((_vids >= _vvoc).any().item()))
+        except Exception:
+            pass
+
         return (
             input_ids,
             inputs_embeds,

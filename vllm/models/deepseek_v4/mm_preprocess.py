@@ -30,6 +30,21 @@ import torch
 # vLLM runs multimodal preprocessing in a thread pool; serialize the encode.
 _TOKENIZER_LOCK = threading.Lock()
 
+# Step-level flag: True only for batches that actually carry image sentinel
+# tokens. Set by the model runner (outside the compiled region) each step;
+# the MoE router reads it to pick between the vision Python router (image
+# batches) and the fused-kernel router (decode / pure-text steps).
+_STEP_HAS_IMAGES = False
+
+
+def set_step_has_images(v: bool) -> None:
+    global _STEP_HAS_IMAGES
+    _STEP_HAS_IMAGES = bool(v)
+
+
+def step_has_images() -> bool:
+    return _STEP_HAS_IMAGES
+
 # Broader fix: the borrow conflict is not limited to our encode() - the API
 # server tokenizes on the event loop while multimodal preprocessing runs in a
 # thread pool, and transformers' set_truncation_and_padding takes a mutable

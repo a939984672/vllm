@@ -736,7 +736,13 @@ class DeepseekV4MoE(nn.Module):
         # lookup. Branch-free because this runs inside the torch.compile region,
         # where a data-dependent `if mask.any()` cannot be captured.
         image_mask = None
-        if input_ids is not None and getattr(self.gate, "bias_vl", None) is not None:
+        from vllm.models.deepseek_v4.mm_preprocess import step_has_images
+
+        if (
+            input_ids is not None
+            and getattr(self.gate, "bias_vl", None) is not None
+            and step_has_images()
+        ):
             image_mask = input_ids >= self.vl_vocab_size
             input_ids = torch.where(
                 image_mask, torch.zeros_like(input_ids), input_ids)
