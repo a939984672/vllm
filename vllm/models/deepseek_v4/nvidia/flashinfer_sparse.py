@@ -428,6 +428,9 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 decode_is_valid_token=decode_is_valid_token,
                 swa_block_span=swa_block_span,
                 compressed_block_span=compressed_block_span,
+                mm_left=getattr(swa_metadata, "mm_left", None),
+                mm_right=getattr(swa_metadata, "mm_right", None),
+                decode_swa_lens=swa_metadata.decode_swa_lens,
             )
             if cache_key != "c4a":
                 swa_metadata.flashinfer_sparse_index_cache[cache_key] = (

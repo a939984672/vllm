@@ -186,6 +186,9 @@ class DeepseekSparseSWAMetadata:
         None  # [num_prefill_tokens, 1, window_size]
     )
     prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
+    # Vision visible-window extents per prefill token (0 outside image spans).
+    mm_left: torch.Tensor | None = None  # [num_prefill_tokens]
+    mm_right: torch.Tensor | None = None  # [num_prefill_tokens]
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -452,6 +455,15 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self._layer_types.add(_layer_type_for(int(ratio)))
 
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        # Vision checkpoints (DSv4-Flash-Vision-Exp): image spans exceed the
+        # SWA window, so the per-token index lists are widened to hold the
+        # full bidirectional span. Non-vision builds keep the stock width.
+        self.mm_visible = (
+            int(getattr(hf_config, "vision_n_layers", 0) or 0) > 0
+        )
+        self.swa_index_width = (
+            self.window_size + 384 if self.mm_visible else self.window_size
+        )
         self.token_to_req_indices = torch.zeros(
             max_tokens,
             dtype=torch.int32,
@@ -460,7 +472,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_swa_indices = torch.zeros(
             max_tokens,
             1,
-            self.window_size,
+            self.swa_index_width,
             dtype=torch.int32,
             device=self.device,
         )
@@ -474,7 +486,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.prefill_swa_indices = torch.zeros(
             max_tokens,
             1,
-            self.window_size,
+            self.swa_index_width,
             dtype=torch.int32,
             device=self.device,
         )
@@ -578,6 +590,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table.stride(0),
                     self.block_size,
                     token_offset=0,
+                    HAS_MM_WINDOW=False,
                     TRITON_BLOCK_SIZE=1024,
                 )
             else:
@@ -586,6 +599,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     decode_swa_indices.stride(0),
                     self.decode_swa_lens,
                     self.window_size,
+                    decode_swa_indices.shape[-1],
+                    token_to_req_indices,
+                    token_to_req_indices,
                     query_start_loc,
                     seq_lens,
                     token_to_req_indices,
@@ -594,20 +610,27 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table.stride(0),
                     self.block_size,
                     token_offset=0,
+                    HAS_MM_WINDOW=False,
                     TRITON_BLOCK_SIZE=1024,
                 )
 
-        # Prefill SWA indices live in paged coordinates. `token_offset` lets
+        mm_left = mm_right = None
+        # Prefill SWA indices live in paged coordinates.
+        # (decode call above passes HAS_MM_WINDOW=False explicitly.) `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
         if num_prefill_tokens > 0:
             prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
+            _has_mm_window = mm_left is not None
             _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
                 prefill_swa_indices,
                 prefill_swa_indices.stride(0),
                 prefill_swa_lens,
                 self.window_size,
+                self.swa_index_width,
+                mm_left if mm_left is not None else token_to_req_indices,
+                mm_right if mm_right is not None else token_to_req_indices,
                 query_start_loc,
                 seq_lens,
                 token_to_req_indices,
@@ -616,8 +639,47 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 block_table.stride(0),
                 self.block_size,
                 token_offset=num_decode_tokens,
+                HAS_MM_WINDOW=_has_mm_window,
                 TRITON_BLOCK_SIZE=1024,
             )
+
+        mm_left = mm_right = None
+        # Vision: per-prefill-token (left, right) visible extents derived from
+        # the request's image doc ranges ([IMAGE_START, IMAGE_END] absolute
+        # positions). Decodes get zeros (text tokens, stock causal window).
+        if (
+            self.mm_visible
+            and num_prefill_tokens > 0
+            and common_attn_metadata.mm_req_doc_ranges
+        ):
+            qsl = common_attn_metadata.query_start_loc_cpu
+            sl_cpu = common_attn_metadata.seq_lens_cpu
+            left_cpu = torch.zeros(num_prefill_tokens, dtype=torch.int32)
+            right_cpu = torch.zeros(num_prefill_tokens, dtype=torch.int32)
+            base = int(qsl[0])
+            for req_idx, ranges in common_attn_metadata.mm_req_doc_ranges.items():
+                if not ranges or req_idx >= common_attn_metadata.num_reqs:
+                    continue
+                qs = int(qsl[req_idx])
+                qe = int(qsl[req_idx + 1])
+                if sl_cpu is not None:
+                    seq_len = int(sl_cpu[req_idx])
+                else:
+                    seq_len = int(seq_lens[req_idx].item())
+                prefix = seq_len - (qe - qs)
+                for (s, e) in ranges:
+                    g = torch.arange(qs, qe, dtype=torch.int32)
+                    gpos = g + prefix
+                    mask = (gpos >= s) & (gpos <= e)
+                    li = ((gpos - s).clamp(max=383) * mask).to(torch.int32)
+                    ri = ((e - gpos).clamp(max=384) * mask).to(torch.int32)
+                    lo = qs - base
+                    left_cpu[lo:lo + (qe - qs)] = torch.maximum(
+                        left_cpu[lo:lo + (qe - qs)], li)
+                    right_cpu[lo:lo + (qe - qs)] = torch.maximum(
+                        right_cpu[lo:lo + (qe - qs)], ri)
+            mm_left = left_cpu.to(self.device)
+            mm_right = right_cpu.to(self.device)
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
@@ -656,6 +718,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 if num_prefill_tokens > 0
                 else None
             ),
+            mm_left=mm_left,
+            mm_right=mm_right,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -796,6 +860,9 @@ def _compute_swa_indices_and_lens_kernel(
     swa_indices_stride,
     swa_lens_ptr,
     window_size,
+    index_width,
+    mm_left_ptr,
+    mm_right_ptr,
     query_start_loc_ptr,
     seq_lens_ptr,
     token_to_req_indices_ptr,
@@ -804,6 +871,7 @@ def _compute_swa_indices_and_lens_kernel(
     block_table_stride,
     block_size,
     token_offset,
+    HAS_MM_WINDOW: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -833,11 +901,19 @@ def _compute_swa_indices_and_lens_kernel(
     pos = prefix_len + token_idx - query_start
     start_pos = tl.maximum(pos - window_size + 1, 0)
     end_pos = pos + 1
+    if HAS_MM_WINDOW:
+        # Vision: image tokens see the full [IMAGE_START, IMAGE_END] span
+        # (bidirectional within the span), bounded by max_image_tokens.
+        left = tl.load(mm_left_ptr + pid)
+        right = tl.load(mm_right_ptr + pid)
+        left_add = tl.maximum(left - (window_size - 1), 0)
+        start_pos = tl.maximum(pos - window_size + 1 - left_add, 0)
+        end_pos = pos + right + 1
 
     swa_len = end_pos - start_pos
     tl.store(swa_lens_ptr + pid, swa_len)
 
-    for i in range(0, window_size, TRITON_BLOCK_SIZE):
+    for i in range(0, index_width, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
 
         pos_offset = start_pos + offset
@@ -853,7 +929,7 @@ def _compute_swa_indices_and_lens_kernel(
         tl.store(
             swa_indices_ptr + pid * swa_indices_stride + offset,
             slot_ids,
-            mask=offset < window_size,
+            mask=offset < index_width,
         )
 
 

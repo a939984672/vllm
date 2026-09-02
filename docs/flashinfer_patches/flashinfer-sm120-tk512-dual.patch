@@ -1,0 +1,33 @@
+diff --git a/csrc/sparse_mla_sm120_prefill.cu b/csrc/sparse_mla_sm120_prefill.cu
+index a1e18ad..c1cc5c2 100644
+--- a/csrc/sparse_mla_sm120_prefill.cu
++++ b/csrc/sparse_mla_sm120_prefill.cu
+@@ -378,7 +378,27 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
+     }                                                 \
+   } while (0)
+ 
+-  if (topk != 128) return false;
++  if (topk != 128 && topk != 512) return false;
++  if (topk == 512) {
++    if (extra_page_block_size == 64) {
++      switch (num_heads) {
++        case 32:
++          DISPATCH_DUAL_MG_CM(FP8, 32, 512, 64, 2);
++          return true;
++        default:
++          return false;
++      }
++    } else if (extra_page_block_size == 2) {
++      switch (num_heads) {
++        case 32:
++          DISPATCH_DUAL_MG_CM(FP8, 32, 512, 2, 2);
++          return true;
++        default:
++          return false;
++      }
++    }
++    return false;
++  }
+   if (extra_page_block_size == 64) {
+     DISPATCH_BY_NH_PBSX(64);
+   } else if (extra_page_block_size == 2) {

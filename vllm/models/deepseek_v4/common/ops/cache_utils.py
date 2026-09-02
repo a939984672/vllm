@@ -836,6 +836,9 @@ def build_flashinfer_mixed_sparse_indices(
     decode_is_valid_token: torch.Tensor | None = None,
     swa_block_span: int | None = None,
     compressed_block_span: int | None = None,
+    mm_left: torch.Tensor | None = None,
+    mm_right: torch.Tensor | None = None,
+    decode_swa_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the FlashInfer DSV4 sparse-index matrix for decode-first batches.
 
@@ -908,6 +911,15 @@ def build_flashinfer_mixed_sparse_indices(
     if num_tokens == 0:
         return sparse_indices, sparse_topk_lens
 
+    # Triton requires valid pointers even for disabled branches (HAS_MM_WINDOW
+    # / HAS_DECODE_SWA_LENS guard the loads); substitute dummy tensors.
+    if mm_left is None:
+        mm_left = token_to_req_indices
+    if mm_right is None:
+        mm_right = token_to_req_indices
+    if decode_swa_lens is None:
+        decode_swa_lens = token_to_req_indices
+
     window_block_size = triton.next_power_of_2(max(swa_index_width, 1))
     topk_block_size = triton.next_power_of_2(max(padded_topk, 1))
     max_block_size = max(window_block_size, topk_block_size)
@@ -953,6 +965,11 @@ def build_flashinfer_mixed_sparse_indices(
         DECODE_COMPRESSED_TOPK=decode_compressed_topk,
         DECODE_COMPRESSED_INDICES_ARE_LOCAL=decode_compressed_indices_are_local,
         HAS_DECODE_COMPRESSED_LENS=has_decode_compressed_lens,
+        MM_LEFT_PTR=mm_left,
+        MM_RIGHT_PTR=mm_right,
+        DECODE_SWA_LENS_PTR=decode_swa_lens,
+        HAS_MM_WINDOW=mm_left is not None,
+        HAS_DECODE_SWA_LENS=decode_swa_lens is not None,
         WINDOW_BLOCK_SIZE=window_block_size,
         TOPK_BLOCK_SIZE=topk_block_size,
         num_warps=num_warps,
@@ -998,6 +1015,9 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
     decode_compressed_stride,
     decode_compressed_topk_lens_ptr,
     decode_is_valid_token_ptr,
+    mm_left_ptr,
+    mm_right_ptr,
+    decode_swa_lens_ptr,
     prefill_topk_indices_ptr,
     prefill_topk_stride,
     query_start_loc_ptr,
@@ -1021,6 +1041,8 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
     DECODE_COMPRESSED_TOPK: tl.constexpr,
     DECODE_COMPRESSED_INDICES_ARE_LOCAL: tl.constexpr,
     HAS_DECODE_COMPRESSED_LENS: tl.constexpr,
+    HAS_MM_WINDOW: tl.constexpr,
+    HAS_DECODE_SWA_LENS: tl.constexpr,
     WINDOW_BLOCK_SIZE: tl.constexpr,
     TOPK_BLOCK_SIZE: tl.constexpr,
 ):
@@ -1089,7 +1111,11 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
             else:
                 compressed_len = tl.full((), DECODE_COMPRESSED_TOPK, dtype=tl.int32)
 
-        tl.store(sparse_topk_lens_ptr + token_idx, SWA_INDEX_WIDTH + compressed_len)
+        if HAS_DECODE_SWA_LENS:
+            swa_len_d = tl.load(decode_swa_lens_ptr + token_idx)
+            tl.store(sparse_topk_lens_ptr + token_idx, swa_len_d + compressed_len)
+        else:
+            tl.store(sparse_topk_lens_ptr + token_idx, SWA_INDEX_WIDTH + compressed_len)
         return
 
     prefill_idx = token_idx - NUM_DECODE_TOKENS
@@ -1101,8 +1127,16 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
     start_pos = seq_len - query_len
     token_idx_in_query = token_idx - query_start
     pos = start_pos + token_idx_in_query
-    swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
-    swa_start_pos = pos - swa_len + 1
+    if HAS_MM_WINDOW:
+        # Vision: image tokens see the full [IMAGE_START, IMAGE_END] span.
+        left = tl.load(mm_left_ptr + prefill_idx)
+        right = tl.load(mm_right_ptr + prefill_idx)
+        left_add = tl.maximum(left - (WINDOW_SIZE - 1), 0)
+        swa_start_pos = tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0)
+        swa_len = tl.minimum(pos + right + 1 - swa_start_pos, SWA_INDEX_WIDTH)
+    else:
+        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        swa_start_pos = pos - swa_len + 1
     topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
 
     for i in range(0, SWA_INDEX_WIDTH, WINDOW_BLOCK_SIZE):
@@ -1157,7 +1191,7 @@ def _build_flashinfer_mixed_sparse_indices_kernel(
             mask=mask,
         )
 
-    tl.store(sparse_topk_lens_ptr + token_idx, SWA_INDEX_WIDTH + topk_len)
+    tl.store(sparse_topk_lens_ptr + token_idx, swa_len + topk_len)
 
 
 def compute_vision_visible_window(
