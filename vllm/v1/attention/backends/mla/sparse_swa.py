@@ -559,6 +559,17 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         decode_swa_width = (
             self.noncausal_index_width if non_causal else self.window_size
         )
+        # Visible-window only needs the widened SWA rows for steps that
+        # actually carry image tokens. Pure-text prefill keeps the stock
+        # 128-wide rows: the kernel K-loop is 4x shorter, which shows up
+        # directly as first-token latency on long text prompts.
+        try:
+            from vllm.models.deepseek_v4.mm_preprocess import step_has_images
+
+            _widened = self.mm_visible and step_has_images()
+        except Exception:
+            _widened = self.mm_visible
+        step_width = (self.window_size + 384) if _widened else self.window_size
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
@@ -577,7 +588,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     )
                 decode_swa_indices = self.decode_swa_indices_noncausal
                 _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
-                    decode_swa_indices,
+                    decode_swa_indices[:, :, :step_width],
                     decode_swa_indices.stride(0),
                     self.decode_swa_lens,
                     self.window_size,
@@ -595,11 +606,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 )
             else:
                 _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                    decode_swa_indices,
+                    decode_swa_indices[:, :, :step_width],
                     decode_swa_indices.stride(0),
                     self.decode_swa_lens,
                     self.window_size,
-                    decode_swa_indices.shape[-1],
+                    step_width,
                     token_to_req_indices,
                     token_to_req_indices,
                     query_start_loc,
@@ -615,6 +626,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 )
 
         mm_left = mm_right = None
+
         # Prefill SWA indices live in paged coordinates.
         # (decode call above passes HAS_MM_WINDOW=False explicitly.) `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
@@ -624,11 +636,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
             _has_mm_window = mm_left is not None
             _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
-                prefill_swa_indices,
+                prefill_swa_indices[:, :, :step_width],
                 prefill_swa_indices.stride(0),
                 prefill_swa_lens,
                 self.window_size,
-                self.swa_index_width,
+                step_width,
                 mm_left if mm_left is not None else token_to_req_indices,
                 mm_right if mm_right is not None else token_to_req_indices,
                 query_start_loc,
@@ -674,10 +686,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     li = ((gpos - s).clamp(max=383) * mask).to(torch.int32)
                     ri = ((e - gpos).clamp(max=384) * mask).to(torch.int32)
                     lo = qs - base
-                    left_cpu[lo:lo + (qe - qs)] = torch.maximum(
-                        left_cpu[lo:lo + (qe - qs)], li)
-                    right_cpu[lo:lo + (qe - qs)] = torch.maximum(
-                        right_cpu[lo:lo + (qe - qs)], ri)
+                    # Clamp to the buffer: query_start_loc / padding can
+                    # make the request slice shorter than the range, which
+                    # would make the maximum() shapes disagree.
+                    n = min(qe - qs, max(num_prefill_tokens - lo, 0))
+                    if n <= 0:
+                        continue
+                    left_cpu[lo:lo + n] = torch.maximum(
+                        left_cpu[lo:lo + n], li[:n])
+                    right_cpu[lo:lo + n] = torch.maximum(
+                        right_cpu[lo:lo + n], ri[:n])
             mm_left = left_cpu.to(self.device)
             mm_right = right_cpu.to(self.device)
 
